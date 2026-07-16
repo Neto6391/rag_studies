@@ -54,6 +54,7 @@ export default function AppLayout() {
             options={[
               { label: "Agentic RAG", value: "agentic" },
               { label: "Simple RAG", value: "simple" },
+              { label: "Mangaba RAG", value: "mangaba" },
             ]}
           />
 

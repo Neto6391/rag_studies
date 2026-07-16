@@ -1,4 +1,4 @@
-export type BackendId = "agentic" | "simple";
+export type BackendId = "agentic" | "simple" | "mangaba";
 
 export interface BackendOption {
   id: BackendId;

@@ -9,10 +9,12 @@ import { BackendId, BackendOption } from "../domain/models";
 
 const AGENTIC_URL = import.meta.env.VITE_AGENTIC_URL ?? "http://localhost:8000";
 const SIMPLE_URL = import.meta.env.VITE_SIMPLE_URL ?? "http://localhost:8001";
+const MANGABA_URL = import.meta.env.VITE_MANGABA_URL ?? "http://localhost:8002";
 
 export const BACKENDS: Record<BackendId, BackendOption> = {
   agentic: { id: "agentic", label: "Agentic RAG", baseUrl: AGENTIC_URL },
   simple: { id: "simple", label: "Simple RAG", baseUrl: SIMPLE_URL },
+  mangaba: { id: "mangaba", label: "Mangaba RAG", baseUrl: MANGABA_URL },
 };
 
 const STORAGE_KEY = "rag.backend";
