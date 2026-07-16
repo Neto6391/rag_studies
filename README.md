@@ -1,7 +1,7 @@
 # RAG Studies
 
 Estudo de RAG (Retrieval-Augmented Generation) com corpus de obras de Machado de Assis.
-Dois backends independentes, com a mesma Clean Architecture, mostrando a evolução de um
+Três backends independentes, com a mesma Clean Architecture, mostrando a evolução de um
 RAG simples para um RAG orquestrado e "production-ready", mais um **frontend React**
 (backoffice) com dashboard de métricas e um chat estilo Instagram DM.
 
@@ -10,13 +10,16 @@ RAG simples para um RAG orquestrado e "production-ready", mais um **frontend Rea
 │  frontend  │ ─────▶ │  simple-rag  │        │  Qdrant  (vetorial)  │
 │ React+antd │  ⇄     │   :8001      │ ─────▶ │  Redis   (cache)     │
 │  :5173     │ ─────▶ │  agentic-rag │        │  SQLite  (conversas) │
-└────────────┘        │   :8000      │        └──────────────────────┘
+│            │        │   :8000      │        └──────────────────────┘
+│            │ ─────▶ │  mangaba-rag │
+└────────────┘        │   :8002      │
    seletor de backend └──────────────┘
 ```
 
 ## Infra compartilhada (Docker)
 
-Os dois projetos usam **Redis** (cache) e **Qdrant** (banco vetorial). Suba os dois com:
+Os três projetos usam **Redis** para cache. Simple e Agentic também usam
+**Qdrant**; Mangaba GraphRAG não usa banco vetorial denso.
 
 ```bash
 docker compose up -d
@@ -47,18 +50,29 @@ Mesma arquitetura, com **reranker** e orquestração via **LangGraph**:
 - **Reranker**: `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`
 - **Orquestração**: LangGraph `StateGraph`
 
+### `mangaba-rag/`
+
+GraphRAG **sem Qdrant**: **NER → grafo (entidades→capítulos) + Node2Vec + lexical
+→ rerank → generate**. Um agente **coordinator** Mangaba A2A conduz o fluxo.
+
+- **Retrieval**: entidades no grafo + similaridade estrutural Node2Vec + keyword,
+  fundidos por **RRF**; com **tie-break de frase** (garante o capítulo que introduz
+  uma expressão citada).
+- **Reranker** (flag `RERANK_STRATEGY`): `cross_encoder` (default, determinístico
+  6/6, grátis) ou `llm` (LLM-as-reranker — entende o PT arcaico de 1881, fecha 7/7).
+- Detalhes e "como rodar" em [`mangaba-rag/README.md`](mangaba-rag/README.md).
+
 ## Diferenças
 
-| | simple-rag | agentic-rag |
-|---|---|---|
-| Orquestração | Pipeline plano (steps async) | LangGraph `StateGraph` |
-| Reranker | Não | Cross-encoder multilíngue |
-| Retrieval | Top-5 direto | Top-10 → rerank → top-5 |
-| Banco vetorial | Qdrant | Qdrant |
-| Cache | Redis (TTL) | Redis (TTL) |
-| Arquitetura | Clean Architecture | Clean Architecture |
+| | simple-rag | agentic-rag | mangaba-rag |
+|---|---|---|---|
+| Orquestração | Pipeline async | LangGraph | Mangaba A2A (coordinator) |
+| Reranker | Não | Cross-encoder | Cross-encoder **ou LLM** (flag) |
+| Retrieval | Dense + keyword | Dense + keyword | Grafo + Node2Vec + lexical (RRF) |
+| Qdrant | Sim | Sim | Não |
+| Cache | Redis | Redis | Redis |
 
-## O que os dois têm em comum
+## O que os três têm em comum
 
 - **Clean Architecture**: Controller → Service → UseCase → Infra/Domain. O controller
   nunca chama o use case direto — sempre passa pelo service.
@@ -72,7 +86,7 @@ Mesma arquitetura, com **reranker** e orquestração via **LangGraph**:
 - **Persistência de conversas** (SQLite): cada mensagem do chat é gravada; a cada
   resposta, um juiz de grounding roda em **background** e marca se ela alucinou.
 
-## Endpoints (nos dois projetos)
+## Endpoints (nos três projetos)
 
 - `GET /search/?query=...` — busca + resposta do LLM (com cache).
 - `GET /evaluate/` — roda o gold set e retorna `retrieval_accuracy` e `hallucination_rate`.
@@ -89,7 +103,7 @@ backoffice (usuário "logado") com:
 
 - **Dashboard**: cards de estatística + gráfico de pizza da composição do corpus.
 - **Chat** estilo Instagram DM com o "Machado de Assis" respondendo pelo RAG.
-- **Seletor de backend** no header: alterna ao vivo entre Simple e Agentic.
+- **Seletor de backend** no header: alterna ao vivo entre Simple, Agentic e Mangaba.
 - **Toasts** de erro (antd) reaproveitando as mensagens de erro do backend (ex.: 502).
 
 ## Setup
@@ -98,11 +112,11 @@ backoffice (usuário "logado") com:
 docker compose up -d                 # sobe Redis + Qdrant
 
 # --- backends (um terminal cada) ---
-cd agentic-rag                       # e, em outro terminal, cd simple-rag
+cd agentic-rag                       # repita para simple-rag e mangaba-rag
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env-example .env                 # preencha OPENROUTER_API_KEY
-uvicorn app:app --port 8000          # agentic :8000 · simple use --port 8001
+uvicorn app:app --port 8000          # agentic :8000 · simple :8001 · mangaba :8002
 # 1º start popula o Qdrant; próximos são rápidos
 
 # --- frontend ---
@@ -111,9 +125,10 @@ npm install
 npm run dev                          # http://localhost:5173
 ```
 
-O frontend lê `VITE_AGENTIC_URL` / `VITE_SIMPLE_URL` do `.env` (default :8000 / :8001).
+O frontend lê `VITE_AGENTIC_URL`, `VITE_SIMPLE_URL` e `VITE_MANGABA_URL`
+(defaults :8000, :8001 e :8002).
 
 ## Corpus
 
-Ambos usam o mesmo corpus: 497 capítulos de 3 obras de Machado de Assis (Memórias
+Os três usam o mesmo corpus: 497 capítulos de 3 obras de Machado de Assis (Memórias
 Póstumas, Dom Casmurro, Quincas Borba), extraídos do Project Gutenberg.
