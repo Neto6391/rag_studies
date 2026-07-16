@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# chat SQLite DB (runtime)
+data/chat.db
+data/chat.db-*

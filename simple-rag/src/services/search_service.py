@@ -1,20 +1,31 @@
-from src.use_cases.search_use_case import SearchUseCase
+from typing import List
+
 from src.domain.search import Search
-from src.services.sentence_transformer_service import EmbeddingServiceProtocol
-from src.domain.llm import LLMServiceProtocol
+from src.infrastructure.redis_cache import CacheService
+from src.use_cases.search_use_case import SearchUseCase
 
 
 class SearchService:
-    def __init__(
-        self,
-        use_case: SearchUseCase | None = None,
-        embedding_service: EmbeddingServiceProtocol | None = None,
-        llm_service: LLMServiceProtocol | None = None,
-    ) -> None:
-        self._use_case = use_case or SearchUseCase()
-        self._embedding_service = embedding_service
-        self._llm_service = llm_service
+    """Orquestra a busca: consulta o cache primeiro; em miss, roda o pipeline
+    (use case) e guarda o resultado no cache. Instância única (singleton via
+    app.state), então o controller nunca recria services por request."""
 
-    def get_search(self, query: str, embedding_service: EmbeddingServiceProtocol, llm_service: LLMServiceProtocol) -> Search:
-        return self._use_case.execute(query, embedding_service, llm_service)
+    def __init__(self, use_case: SearchUseCase, cache_service: CacheService) -> None:
+        self._use_case = use_case
+        self._cache = cache_service
 
+    async def search(self, query: str) -> Search:
+        cached = await self._cache.get(query)
+        if cached is not None:
+            return cached
+
+        result = await self._use_case.execute(query)
+        await self._cache.set(query, result)
+        return result
+
+    async def retrieve(self, query: str) -> List[dict]:
+        """Recupera documentos sem gerar resposta (e sem cache miss de LLM)."""
+        cached = await self._cache.get(query)
+        if cached is not None:
+            return cached.results
+        return await self._use_case.retrieve(query)

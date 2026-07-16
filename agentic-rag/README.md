@@ -1,149 +1,118 @@
 # Agentic RAG
 
-RAG agnóstico com LangGraph e reranker (cross-encoder), usando Clean Architecture e obras de Machado de Assis como corpus.
+RAG em Python com Clean Architecture sobre obras de Machado de Assis, orquestrado com
+**LangGraph** e com **reranker** (cross-encoder). Usa Qdrant (banco vetorial), Redis
+(cache) e métricas de avaliação.
 
 ## Como funciona
 
 ```
-Query → [retrieve] → [rerank] → [generate] → Resposta
+Query → [retrieve: dense ∪ keyword] → [rerank] → [generate] → Resposta
 ```
 
-1. **Retrieve**: embedda a query, busca top-10 no corpus por similaridade cosseno
-2. **Rerank**: cross-encoder re-ordena os 10 documentos, fica com os top-5
-3. **Generate**: envia os 5 documentos + query pro LLM gerar a resposta
+1. **retrieve**: busca densa (top-10 no Qdrant) **unida** a hits lexicais
+   (substring no `corpus.jsonl` — frases citadas / n-gramas; sem BM25).
+2. **rerank**: o cross-encoder re-ordena os candidatos e mantém os top-5.
+3. **generate**: envia os 5 documentos + query ao LLM (OpenRouter).
 
-O LangGraph orquestra esse fluxo como um StateGraph com 3 nós sequenciais.
+O LangGraph orquestra isso como um `StateGraph` de 3 nós assíncronos. O `SearchService`
+consulta o **cache Redis** antes de rodar o grafo; em miss, executa e guarda com TTL.
 
 ## Arquitetura
 
 ```
 agentic-rag/
-├── app.py                          # Entry point FastAPI + lifespan (load modelos + corpus)
-├── .env                            # OPENROUTER_API_KEY
+├── app.py                              # FastAPI + lifespan (cria singletons, popula Qdrant)
+├── docker-compose.yml                  # (na raiz do repo) Redis + Qdrant
+├── requirements.txt
 ├── data/
-│   └── corpus.jsonl                # Corpus de obras de Machado de Assis (497 capítulos)
+│   ├── corpus.jsonl                    # 497 capítulos de Machado de Assis
+│   └── eval.jsonl                      # gold set para /evaluate
+├── scripts/
+│   └── ingest.py                       # ingere o corpus no Qdrant (roda uma vez)
 └── src/
-    ├── domain/                     # Camada de domínio (entidades e protocolos)
-    │   ├── search.py               # Search (dataclass) + SearchQueryParamsInput (Pydantic)
-    │   ├── graph_state.py          # GraphState (TypedDict) — estado do LangGraph
-    │   ├── embedding.py            # EmbeddingServiceProtocol (interface)
-    │   ├── reranker.py             # RerankerServiceProtocol (interface)
-    │   └── llm.py                  # LLMServiceProtocol (interface)
+    ├── config.py                       # Settings lidas do .env
+    ├── domain/                         # entidades + protocolos (interfaces)
+    │   ├── search.py                   # Search + SearchQueryParamsInput
+    │   ├── graph_state.py              # GraphState (estado do LangGraph)
+    │   ├── evaluation.py               # EvaluationResult
+    │   ├── embedding.py / llm.py / reranker.py   # protocolos dos services
     ├── infrastructure/
-    │   └── corpus_vector_store.py  # Singleton: carrega corpus, vetoriza e faz busca por similaridade cosseno
-    ├── services/                   # Camada de serviços (implementações concretas)
-    │   ├── sentence_transformer_service.py  # Embedding com sentence-transformers (singleton)
-    │   ├── reranker_service.py              # Cross-encoder reranker (singleton)
-    │   ├── openrouter_service.py            # LLM via OpenRouter API (httpx)
-    │   └── search_service.py                # Orquestra SearchUseCase
-    ├── use_cases/                  # Camada de casos de uso (regras de negócio)
-    │   └── search_use_case.py      # Constrói e executa o StateGraph (retrieve → rerank → generate)
-    └── controllers/                # Camada de controllers (FastAPI routers)
-        └── search_controller.py    # GET /search?query=...
+│   ├── qdrant_vector_store.py      # busca vetorial no Qdrant (async)
+│   ├── keyword_store.py            # busca lexical simples (substring, sem BM25)
+│   └── redis_cache.py              # cache de busca com TTL (async)
+    ├── services/                       # implementações concretas
+    │   ├── sentence_transformer_service.py  # embeddings (modelo singleton)
+    │   ├── reranker_service.py              # cross-encoder (modelo singleton)
+    │   ├── openrouter_service.py            # LLM async + juiz de grounding
+    │   ├── search_service.py                # cache + orquestra o use case
+    │   └── evaluation_service.py            # orquestra o use case de avaliação
+    ├── use_cases/                      # regras de negócio
+    │   ├── search_use_case.py          # StateGraph retrieve → rerank → generate
+    │   └── evaluate_use_case.py        # calcula as métricas
+    └── controllers/                    # rotas FastAPI
+        ├── deps.py                     # providers dos services singleton (Depends)
+        ├── search_controller.py        # GET /search
+        └── evaluate_controller.py      # GET /evaluate
 ```
 
-### Fluxo da arquitetura
+### Princípios
 
-```
-Controller → Service → UseCase (LangGraph) → Infrastructure/Domain
-```
+- **Controller → Service → UseCase → Infra/Domain**. O controller só recebe o service
+  singleton via `Depends` e chama `await service.search(query)` — nunca o use case direto.
+- **Singletons**: services (incluindo embedding e reranker) criados uma vez no `lifespan`
+  (em `app.state`), nunca por request.
+- **Async**: endpoints e I/O (LLM, Redis, Qdrant) assíncronos; embedding e reranker (CPU)
+  rodam em `asyncio.to_thread` dentro dos nós do grafo.
 
-- **Domain**: entidades e protocolos (interfaces) — sem dependências externas
-- **Infrastructure**: persistência e vetorização do corpus em memória
-- **Services**: implementações concretas (embedding, reranker, LLM, orquestração)
-- **UseCases**: constrói o StateGraph do LangGraph com os nós retrieve → rerank → generate
-- **Controllers**: rotas FastAPI, única camada que usa `Depends()`
-
-## Corpus
-
-O corpus contém 497 capítulos extraídos de 3 obras de Machado de Assis, obtidas via Project Gutenberg:
-
-- **Memórias Póstumas de Brás Cubas**
-- **Dom Casmurro**
-- **Quincas Borba**
-
-Cada entrada no `data/corpus.jsonl` segue o formato:
-
-```json
-{
-  "id": "machado-dom-casmurro-cap-045",
-  "source": "project_gutenberg",
-  "title": "Dom Casmurro - Capítulo XLV",
-  "text": "conteúdo do capítulo...",
-  "metadata": {
-    "autor": "Machado de Assis",
-    "ano": 1899,
-    "genero": "romance",
-    "livro": "Dom Casmurro",
-    "capitulo": 45,
-    "gutenberg_id": 385
-  }
-}
-```
-
-## Como Executar
-
-### Pré-requisitos
-
-- Python 3.12+
-- WSL (recomendado) ou Python nativo compatível com wheels do PyPI
-
-### Instalação
+## Como executar
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install torch sentence-transformers fastapi uvicorn httpx python-dotenv numpy langgraph
+# na raiz do repo:
+docker compose up -d
+
+cd agentic-rag
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env-example .env            # preencha OPENROUTER_API_KEY
+uvicorn app:app --reload
 ```
 
-### Configuração
+No **primeiro** start, o corpus é vetorizado e gravado no Qdrant (`scripts/ingest.py`).
+Nos próximos starts a ingestão é pulada — startup rápido.
 
-Crie um arquivo `.env` na raiz do projeto:
-
-```
-OPENROUTER_API_KEY=sua_chave_aqui
-```
-
-### Executar
-
-```bash
-uvicorn app:app --host 0.0.0.0 --reload
-```
-
-No startup, os modelos de embedding e reranker são carregados e todo o corpus é vetorizado e mantido em memória. No shutdown, a memória é limpa.
+Para reingerir manualmente: `python -m scripts.ingest`.
 
 ## Endpoints
 
-### `GET /search?query=...`
+### `GET /search/?query=...`
 
-Busca semântica no corpus + reranking + geração de resposta via LLM.
+Busca semântica + reranking + resposta do LLM (com cache Redis).
 
-**Parâmetros:**
-- `query` (string, obrigatório): pergunta ou termo de busca
-
-**Resposta:**
 ```json
 {
-  "response": "Resposta gerada pelo LLM baseada no contexto rerankeado...",
+  "response": "Resposta gerada pelo LLM...",
   "results": [
-    {
-      "id": "machado-dom-casmurro-cap-042",
-      "title": "Dom Casmurro - Capítulo XLIV",
-      "source": "project_gutenberg",
-      "score": 0.5752,
-      "rerank_score": 8.123,
-      "text": "trecho do capítulo..."
-    }
+    { "id": "machado-dom-casmurro-cap-031", "title": "...", "source": "...",
+      "score": 0.57, "rerank_score": 8.12, "text": "trecho..." }
   ]
 }
 ```
 
-## Tecnologias
+### `GET /evaluate/`
 
-- **LangGraph** — orquestração do fluxo (StateGraph: retrieve → rerank → generate)
-- **FastAPI** — framework web
-- **sentence-transformers** — embeddings (`paraphrase-multilingual-MiniLM-L12-v2`) + reranker (`cross-encoder/stsb-distilbert-multilingual`)
-- **OpenRouter** — API de LLM (default: `openai/gpt-4o-mini`)
-- **NumPy** — similaridade cosseno entre vetores
-- **httpx** — cliente HTTP para OpenRouter
-- **python-dotenv** — variáveis de ambiente
+Roda o gold set (`data/eval.jsonl`) pelo pipeline e retorna `retrieval_accuracy`
+(hit@k) e `hallucination_rate` (LLM-as-judge). Mesmo formato do simple-rag.
+
+## Configuração (`.env`)
+
+```
+OPENROUTER_API_KEY=sk-...
+OPENROUTER_MODEL=openai/gpt-4o-mini
+REDIS_URL=redis://localhost:6379/0
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=machado_agentic
+CACHE_TTL_SECONDS=3600
+RETRIEVE_TOP_K=10
+RERANK_TOP_K=5
+```

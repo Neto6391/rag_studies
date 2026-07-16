@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+numpy
+torch
+sentence-transformers
+langgraph
+redis
+qdrant-client
+aiosqlite
