@@ -1,137 +1,127 @@
 # Simple RAG
 
-Sistema RAG (Retrieval-Augmented Generation) em Python com Clean Architecture, usando obras de Machado de Assis como corpus.
+RAG em Python com Clean Architecture sobre obras de Machado de Assis.
+Pipeline direto: **retrieve → generate**, com Qdrant (banco vetorial), Redis (cache) e
+métricas de avaliação.
+
+## Como funciona
+
+```
+Query → [retrieve: dense ∪ keyword] → [generate] → Resposta
+```
+
+1. **retrieve**: busca densa (top-5 no Qdrant) **unida** a hits lexicais
+   (substring no `corpus.jsonl` — frases citadas / n-gramas; sem BM25).
+   Sem reranker, os hits de keyword entram primeiro no top-k.
+2. **generate**: envia os documentos + query ao LLM (OpenRouter) para gerar a resposta.
+
+O `SearchService` consulta o **cache Redis** antes de rodar o pipeline; em cache miss,
+executa e guarda o resultado com TTL.
 
 ## Arquitetura
 
 ```
 simple-rag/
-├── app.py                          # Entry point FastAPI + lifespan (load/clear corpus)
-├── .env                            # OPENROUTER_API_KEY
+├── app.py                              # FastAPI + lifespan (cria singletons, popula Qdrant)
+├── docker-compose.yml                  # (na raiz do repo) Redis + Qdrant
+├── requirements.txt
 ├── data/
-│   └── corpus.jsonl                # Corpus de obras de Machado de Assis (497 capítulos)
+│   ├── corpus.jsonl                    # 497 capítulos de Machado de Assis
+│   └── eval.jsonl                      # gold set para /evaluate
 ├── scripts/
-│   └── build_corpus.py             # Script para baixar e processar obras do Project Gutenberg
+│   └── ingest.py                       # ingere o corpus no Qdrant (roda uma vez)
 └── src/
-    ├── domain/                     # Camada de domínio (entidades e protocolos)
-    │   ├── search.py               # Search (dataclass) + SearchQueryParamsInput (Pydantic)
-    │   ├── embedding.py            # EmbeddingServiceProtocol (interface)
-    │   └── llm.py                  # LLMServiceProtocol (interface)
+    ├── config.py                       # Settings lidas do .env
+    ├── domain/                         # entidades + protocolos (interfaces)
+    │   ├── search.py                   # Search + SearchQueryParamsInput
+    │   ├── evaluation.py               # EvaluationResult
+    │   ├── embedding.py / llm.py       # protocolos dos services
     ├── infrastructure/
-    │   └── corpus_vector_store.py  # Singleton: carrega corpus, vetoriza e faz busca por similaridade cosseno
-    ├── services/                   # Camada de serviços (implementações concretas)
-    │   ├── sentence_transformer_service.py  # Embedding com sentence-transformers (singleton model)
-    │   ├── openrouter_service.py            # LLM via OpenRouter API (httpx)
-    │   ├── search_service.py                # Orquestra SearchUseCase
-    │   └── answer_service.py                # Orquestra AnswerUseCase (não registrado)
-    ├── use_cases/                  # Camada de casos de uso (regras de negócio)
-    │   ├── search_use_case.py      # Busca semântica + geração de resposta via LLM
-    │   └── answer_use_case.py      # Alternativa isolada de answer (não registrada)
-    └── controllers/                # Camada de controllers (FastAPI routers)
-        ├── search_controller.py    # GET /search?query=...
-        └── ask_controller.py       # GET /ask?question=... (não registrado)
+    │   ├── qdrant_vector_store.py      # busca vetorial no Qdrant (async)
+    │   ├── keyword_store.py            # busca lexical simples (substring, sem BM25)
+    │   └── redis_cache.py              # cache de busca com TTL (async)
+    ├── services/                       # implementações concretas
+    │   ├── sentence_transformer_service.py  # embeddings (modelo singleton)
+    │   ├── openrouter_service.py            # LLM async + juiz de grounding
+    │   ├── search_service.py                # cache + orquestra o use case
+    │   └── evaluation_service.py            # orquestra o use case de avaliação
+    ├── use_cases/                      # regras de negócio
+    │   ├── pipeline.py                 # runner minúsculo de steps async
+    │   ├── search_use_case.py          # pipeline retrieve → generate
+    │   └── evaluate_use_case.py        # calcula as métricas
+    └── controllers/                    # rotas FastAPI
+        ├── deps.py                     # providers dos services singleton (Depends)
+        ├── search_controller.py        # GET /search
+        └── evaluate_controller.py      # GET /evaluate
 ```
 
-### Fluxo da arquitetura
+### Princípios
 
-```
-Controller → Service → UseCase → Infrastructure/Domain
-```
+- **Controller → Service → UseCase → Infra/Domain**. O controller só recebe o service
+  singleton via `Depends` e chama `await service.search(query)` — nunca o use case direto.
+- **Singletons**: services criados uma vez no `lifespan` (em `app.state`), nunca por request.
+- **Async**: endpoints e I/O (LLM, Redis, Qdrant) assíncronos; embedding roda em thread.
 
-- **Domain**: entidades e protocolos (interfaces) — sem dependências externas
-- **Infrastructure**: persistência e vetorização do corpus em memória
-- **Services**: implementações concretas (embedding, LLM, orquestração)
-- **UseCases**: regras de negócio (busca semântica + geração de resposta)
-- **Controllers**: rotas FastAPI, única camada que usa `Depends()`
-
-## Corpus
-
-O corpus contém 497 capítulos extraídos de 3 obras de Machado de Assis, obtidas via Project Gutenberg:
-
-- **Memórias Póstumas de Brás Cubas**
-- **Dom Casmurro**
-- **Quincas Borba**
-
-Cada entrada no `data/corpus.jsonl` segue o formato:
-
-```json
-{
-  "id": "machado-dom-casmurro-cap-045",
-  "source": "project_gutenberg",
-  "title": "Dom Casmurro - Capítulo XLV",
-  "text": "conteúdo do capítulo...",
-  "metadata": {
-    "autor": "Machado de Assis",
-    "ano": 1899,
-    "genero": "romance",
-    "livro": "Dom Casmurro",
-    "capitulo": 45,
-    "gutenberg_id": 385
-  }
-}
-```
-
-## Como Executar
-
-### Pré-requisitos
-
-- Python 3.12+
-- WSL (recomendado) ou Python nativo compatível com wheels do PyPI
-
-### Instalação
+## Como executar
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install torch sentence-transformers fastapi uvicorn httpx python-dotenv numpy
+# na raiz do repo:
+docker compose up -d
+
+cd simple-rag
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env-example .env            # preencha OPENROUTER_API_KEY
+uvicorn app:app --reload
 ```
 
-### Configuração
+No **primeiro** start, o corpus é vetorizado e gravado no Qdrant (`scripts/ingest.py`).
+Nos próximos starts a ingestão é pulada (a coleção já existe) — startup rápido.
 
-Crie um arquivo `.env` na raiz do projeto:
-
-```
-OPENROUTER_API_KEY=sua_chave_aqui
-```
-
-### Executar
-
-```bash
-uvicorn app:app --host 0.0.0.0 --reload
-```
-
-No startup, o modelo de embeddings é carregado e todo o corpus é vetorizado e mantido em memória. No shutdown, a memória é limpa.
+Para reingerir manualmente: `python -m scripts.ingest`.
 
 ## Endpoints
 
-### `GET /search?query=...`
+### `GET /search/?query=...`
 
-Busca semântica no corpus + geração de resposta via LLM.
+Busca semântica + resposta do LLM (com cache Redis).
 
-**Parâmetros:**
-- `query` (string, obrigatório): pergunta ou termo de busca
-
-**Resposta:**
 ```json
 {
-  "response": "Resposta gerada pelo LLM baseada no contexto recuperado...",
+  "response": "Resposta gerada pelo LLM...",
   "results": [
-    {
-      "id": "machado-dom-casmurro-cap-042",
-      "title": "Dom Casmurro - Capítulo XLIV",
-      "source": "project_gutenberg",
-      "score": 0.5752,
-      "text": "trecho do capítulo..."
-    }
+    { "id": "machado-dom-casmurro-cap-031", "title": "...", "source": "...",
+      "score": 0.57, "text": "trecho..." }
   ]
 }
 ```
 
-## Tecnologias
+### `GET /evaluate/`
 
-- **FastAPI** — framework web
-- **sentence-transformers** — modelo `paraphrase-multilingual-MiniLM-L12-v2` para embeddings
-- **OpenRouter** — API de LLM (default: `openai/gpt-4o-mini`)
-- **NumPy** — similaridade cosseno entre vetores
-- **httpx** — cliente HTTP para OpenRouter
-- **python-dotenv** — variáveis de ambiente
+Roda o gold set (`data/eval.jsonl`) pelo pipeline e retorna as métricas:
+
+```json
+{
+  "retrieval_accuracy": 0.83,
+  "hallucination_rate": 0.17,
+  "n": 6,
+  "details": [ { "query": "...", "hit": true, "grounded": true, "retrieved_ids": ["..."] } ]
+}
+```
+
+- **retrieval_accuracy** (hit@k): fração de perguntas em que algum documento relevante
+  esperado aparece no top-k.
+- **hallucination_rate**: fração de respostas que o LLM-juiz considera não fundamentadas
+  no contexto recuperado.
+
+## Configuração (`.env`)
+
+```
+OPENROUTER_API_KEY=sk-...
+OPENROUTER_MODEL=openai/gpt-4o-mini
+REDIS_URL=redis://localhost:6379/0
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=machado_simple
+CACHE_TTL_SECONDS=3600
+TOP_K=5
+```

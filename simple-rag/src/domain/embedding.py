@@ -1,5 +1,9 @@
 from typing import List, Protocol
 
+
 class EmbeddingServiceProtocol(Protocol):
     def generate(self, text: str) -> List[float]:
-        pass
+        ...
+
+    def generate_batch(self, texts: List[str]) -> List[List[float]]:
+        ...
